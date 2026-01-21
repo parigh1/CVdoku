@@ -1,20 +1,15 @@
 import cv2
 import os
-import sys
+import numpy as np
 from src.vision import VisionEngine
 from src.classifier import DigitClassifier
+from src.solver import SudokuSolver  # <--- NEW IMPORT
 
 
 def main():
-    # --- FIX: SMART PATH FINDING ---
-    # Get the folder where main.py is located
+    # --- SMART PATH FINDING ---
     base_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Construct the full path to the model
     model_path = os.path.join(base_dir, 'models', 'digit_model.h5')
-
-    # Debug: Print where we are looking to be sure
-    print(f"Looking for model at: {model_path}")
 
     if not os.path.exists(model_path):
         print("ERROR: File not found! Please check if 'models/digit_model.h5' exists.")
@@ -23,13 +18,15 @@ def main():
     # 1. Initialize Engines
     vision = VisionEngine()
     classifier = DigitClassifier(model_path)
+    solver = SudokuSolver()  # <--- NEW INITIALIZATION
 
     cap = cv2.VideoCapture(0)
+    # Set resolution (optional, helps with speed)
     cap.set(3, 1280)
     cap.set(4, 720)
 
     print("------------------------------------------------")
-    print("Press 's' to Scan the board (when Green Box is stable)")
+    print("Press 's' to Scan & Solve")
     print("Press 'q' to Quit")
     print("------------------------------------------------")
 
@@ -46,42 +43,40 @@ def main():
 
             # --- USER TRIGGER: Press 's' to Solve ---
             if cv2.waitKey(1) & 0xFF == ord('s'):
-                print("Scanning...")
+                print("\n--- SCANNING ---")
 
                 # 1. Warp
                 img_warped = vision.get_warp(img, board_contour)
 
-                # 2. Slice
+                # 2. Slice & Predict
                 img_warped_gray = cv2.cvtColor(img_warped, cv2.COLOR_BGR2GRAY)
                 boxes = vision.split_boxes(img_warped_gray)
-
-                # 3. Predict
                 numbers = classifier.predict(boxes)
 
-                # 4. Display Results in Terminal
-                print("Detected Sudoku Grid:")
-                import numpy as np
+                # 3. Construct Grid
                 grid = np.array(numbers).reshape(9, 9)
+                print("Detected Grid:")
                 print(grid)
+
+                # 4. SOLVE
+                # We work on a list copy because 'solve' modifies it in-place
+                grid_list = grid.tolist()
+
+                try:
+                    print("Solving...")
+                    if solver.solve(grid_list):
+                        print("\n>>> SOLVED SUDOKU <<<")
+                        solved_grid = np.array(grid_list)
+                        print(solved_grid)
+                        print("----------------------")
+                    else:
+                        print("Unsolvable! (Likely a detection error)")
+                except Exception as e:
+                    print(f"Error solving: {e}")
 
         cv2.imshow("AR Sudoku", img)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
-
-            # 3. Predict
-            numbers = classifier.predict(boxes)
-
-            # --- NEW: Visual Debugging ---
-            # Draw the detected numbers ON TOP of the warped board
-            img_detected = img_warped.copy()
-            img_detected = vision.display_numbers(img_detected, numbers, color=(255, 0, 255))
-            cv2.imshow("Detected Numbers", img_detected)
-            # -----------------------------
-
-            print("Detected Sudoku Grid:")
-            import numpy as np
-            grid = np.array(numbers).reshape(9, 9)
-            print(grid)
             break
 
     cap.release()
