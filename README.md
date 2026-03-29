@@ -1,4 +1,4 @@
-CVdoku
+#CVdoku
 
 A simple computer vision project that detects and solves Sudoku puzzles in real-time. Just point your camera at a Sudoku grid, and the program recognizes the numbers, solves the puzzle, and shows you the result.
 How it Works
