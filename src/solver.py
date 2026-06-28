@@ -1,3 +1,13 @@
+"""
+CVdoku — Sudoku Solver
+=======================
+v2: Added conflict resolver that tries 1↔7 and 5↔6 swaps
+    when the board has conflicts — catches remaining CNN misreads.
+"""
+
+import copy
+
+
 class SudokuSolver:
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -5,41 +15,85 @@ class SudokuSolver:
     def solve(self, grid: list) -> bool:
         """
         Solve the Sudoku puzzle in-place using backtracking.
-
-        Args:
-            grid: 9×9 list of lists. 0 = empty, 1-9 = given digit.
-
-        Returns:
-            True  if a solution was found (grid is now filled).
-            False if no solution exists (grid is left partially modified).
+        Returns True if solved, False if unsolvable.
         """
         empty = self._find_empty(grid)
         if empty is None:
-            return True   # No empty cells left — solved!
+            return True
 
         row, col = empty
 
         for num in range(1, 10):
             if self._is_valid(grid, row, col, num):
                 grid[row][col] = num
-
                 if self.solve(grid):
                     return True
+                grid[row][col] = 0
 
-                grid[row][col] = 0   # Backtrack
+        return False
 
-        return False   # Trigger backtracking in caller
-
-    def is_valid_board(self, grid: list) -> bool:
+    def solve_with_recovery(self, grid: list) -> tuple:
         """
-        Check whether the given (partially filled) board is valid —
-        i.e. no duplicate digits in any row, column, or 3×3 box.
-
-        Used to catch gross classifier errors before attempting to solve.
+        Try to solve the board. If it has conflicts, attempt automatic
+        correction by trying common CNN misread swaps:
+            1 ↔ 7  (most common — thin digit confusion)
+            5 ↔ 6  (second most common — rounded digit confusion)
+            8 ↔ 9  (occasional — similar shape)
 
         Returns:
-            True if the board is valid, False if there's a conflict.
+            (solved_grid, True)  if solution found
+            (None, False)        if unsolvable even after recovery
         """
+        # First try: direct solve
+        if self.is_valid_board(grid):
+            attempt = copy.deepcopy(grid)
+            if self.solve(attempt):
+                return attempt, True
+
+        # Recovery: try swapping common misread pairs
+        swap_pairs = [(1, 7), (5, 6), (8, 9), (3, 8), (2, 7)]
+
+        for a, b in swap_pairs:
+            recovered = self._try_swap(grid, a, b)
+            if recovered is not None:
+                attempt = copy.deepcopy(recovered)
+                if self.solve(attempt):
+                    print(f"[Solver] Recovered by swapping {a}↔{b}")
+                    return attempt, True
+
+        # Try all combinations of two swaps
+        for i, (a1, b1) in enumerate(swap_pairs):
+            for a2, b2 in swap_pairs[i+1:]:
+                recovered = self._try_swap(grid, a1, b1)
+                if recovered is not None:
+                    recovered2 = self._try_swap(recovered, a2, b2)
+                    if recovered2 is not None:
+                        attempt = copy.deepcopy(recovered2)
+                        if self.solve(attempt):
+                            print(f"[Solver] Recovered by swapping {a1}↔{b1} and {a2}↔{b2}")
+                            return attempt, True
+
+        return None, False
+
+    def _try_swap(self, grid: list, a: int, b: int) -> list:
+        """
+        Return a new grid with all occurrences of digit `a` swapped with `b`.
+        Only returns the swapped grid if it's valid; otherwise returns None.
+        """
+        new_grid = copy.deepcopy(grid)
+        for r in range(9):
+            for c in range(9):
+                if new_grid[r][c] == a:
+                    new_grid[r][c] = b
+                elif new_grid[r][c] == b:
+                    new_grid[r][c] = a
+
+        if self.is_valid_board(new_grid):
+            return new_grid
+        return None
+
+    def is_valid_board(self, grid: list) -> bool:
+        """Check for duplicate digits in any row, column, or 3×3 box."""
         for i in range(9):
             row_vals = [grid[i][j] for j in range(9) if grid[i][j] != 0]
             if len(row_vals) != len(set(row_vals)):
@@ -54,7 +108,7 @@ class SudokuSolver:
                 box_vals = []
                 for r in range(3):
                     for c in range(3):
-                        val = grid[box_row * 3 + r][box_col * 3 + c]
+                        val = grid[box_row*3+r][box_col*3+c]
                         if val != 0:
                             box_vals.append(val)
                 if len(box_vals) != len(set(box_vals)):
@@ -63,20 +117,13 @@ class SudokuSolver:
         return True
 
     def count_givens(self, grid: list) -> int:
-        """
-        Count how many cells are already filled in.
-        A real Sudoku puzzle typically has 17-40 givens.
-        Fewer than 17 is mathematically unsolvable (non-unique solution).
-        """
+        """Count filled cells."""
         return sum(1 for row in grid for val in row if val != 0)
 
     def is_solvable(self, grid: list) -> tuple:
         """
-        Combined sanity check before attempting to solve.
-
-        Returns:
-            (True, "")          if the board looks solvable.
-            (False, reason_str) if something is wrong.
+        Sanity check before solving.
+        Returns (True, "") or (False, reason).
         """
         givens = self.count_givens(grid)
 
@@ -86,20 +133,13 @@ class SudokuSolver:
         if givens == 81:
             return False, "Board is already complete"
 
-        if not self.is_valid_board(grid):
-            return False, "Board has conflicts — likely a misread digit"
-
+        # Note: we don't reject on conflict here anymore —
+        # solve_with_recovery handles that case
         return True, ""
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
-    def _find_empty(self, grid: list) -> tuple | None:
-        """
-        Find the next empty cell (value == 0).
-        Scans row-by-row, left to right.
-
-        Returns (row, col) or None if no empty cell exists.
-        """
+    def _find_empty(self, grid: list):
         for i in range(9):
             for j in range(9):
                 if grid[i][j] == 0:
@@ -107,28 +147,14 @@ class SudokuSolver:
         return None
 
     def _is_valid(self, grid: list, row: int, col: int, num: int) -> bool:
-        """
-        Check whether placing `num` at (row, col) violates any Sudoku rule.
-
-        Checks:
-            1. Row   — num not already in this row
-            2. Column — num not already in this column
-            3. Box   — num not already in the 3×3 sub-grid
-        """
-        # Row check
         if num in grid[row]:
             return False
-
-        # Column check
         if num in [grid[i][col] for i in range(9)]:
             return False
-
-        # 3×3 box check
         box_row = (row // 3) * 3
         box_col = (col // 3) * 3
         for r in range(box_row, box_row + 3):
             for c in range(box_col, box_col + 3):
                 if grid[r][c] == num:
                     return False
-
         return True

@@ -1,8 +1,24 @@
+"""
+CVdoku — Vision Engine
+=======================
+Handles everything between the raw camera frame and 81 cell images:
+  1. Pre-process  → grayscale, blur, adaptive threshold
+  2. Find board   → largest quadrilateral contour in frame
+  3. Warp         → perspective-correct the board to a square
+  4. Split        → slice the warped square into 81 cells
+  5. Draw         → highlight the detected board on the live feed
+
+Design notes:
+- All internal processing is done on grayscale images.
+- The warp output is always WARP_SIZE × WARP_SIZE pixels.
+- Cell images are returned as grayscale crops ready for the classifier.
+"""
+
 import cv2
 import numpy as np
 
-WARP_SIZE = 450   # Output size of the perspective-corrected board (pixels)
-CELL_SIZE = WARP_SIZE // 9   # 50px per cell
+WARP_SIZE = 630   # Output size of the perspective-corrected board (pixels)
+CELL_SIZE = WARP_SIZE // 9   # 70px per cell — more resolution per digit
 
 
 class VisionEngine:
@@ -134,7 +150,7 @@ class VisionEngine:
             List of 81 numpy arrays, row-major order (left-to-right, top-to-bottom).
         """
         cells  = []
-        margin = 4   # pixels to trim from each edge (removes grid lines)
+        margin = 2   # pixels to trim from each edge (removes grid lines)
 
         for row in range(9):
             for col in range(9):
