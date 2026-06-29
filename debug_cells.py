@@ -50,7 +50,7 @@ def main():
         if key==ord(' ') and bc is not None:
             print("[Debug] Analysing...")
             warped = vision.get_warp(frame, bc)
-            cells  = vision.split_boxes(warped)
+            cells  = vision.split_boxes_adaptive(warped)
             predictions, confidences, has_bars, proc_cells = [], [], [], []
             for cell in cells:
                 # Binary for display
@@ -107,7 +107,7 @@ def main():
             if errors:
                 print(f"\n  Errors ({len(errors)}):")
                 for e in errors: print(e)
-            else:
+            else: 
                 print("\n  ✓ All detected digits match expected!")
 
     cap.release(); cv2.destroyAllWindows()

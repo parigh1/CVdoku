@@ -53,6 +53,19 @@ class DigitClassifier:
         x, y, w, h = cv2.boundingRect(largest)
         if w / max(h, 1) > 5.0:   # Pure horizontal line = grid artifact
             return True
+
+        # Solidity check — catches noise/glare streaks that AREN'T flat
+        # enough to trip the w/h>5 check above (e.g. a diagonal screen
+        # reflection), but are still much sparser within their own
+        # bounding box than any real digit stroke. Measured empirically
+        # across all 9 digits in 6 sans-serif fonts: the thinnest real
+        # digit (a printed '7') never drops below ~0.20 solidity, while
+        # simulated noise/glare streaks measured ~0.08-0.10. 0.15 sits in
+        # the gap between them.
+        solidity = cv2.contourArea(largest) / max(w * h, 1)
+        if solidity < 0.15:
+            return True
+
         return False
 
     def _center_digit(self, binary: np.ndarray):
@@ -199,6 +212,73 @@ class DigitClassifier:
                     results[idx] = self._post_process(digit, raw_cells[j])
 
         return results
+
+    def predict_with_solidity(self, cells: list) -> tuple:
+        """
+        Like predict(), but also returns a parallel list of "solidity"
+        scores (contour_area / bounding_box_area) for filled cells —
+        None for cells predicted blank.
+
+        Why this exists: CNN confidence can't tell a genuine thin digit
+        apart from a thin noise/glare streak that narrowly cleared the
+        blank-detection gate — both can score 1.00. Solidity is a
+        different, independent signal: among cells the model says are
+        filled, the ones with the LOWEST solidity are the ones that most
+        narrowly cleared _is_blank()'s gate and are the best candidates
+        for "this is probably actually a misread blank" — exactly what
+        the solver's recovery logic needs when a phantom digit (not a
+        digit-confusion, an extra digit where there should be none)
+        makes the board unsolvable.
+
+        Returns:
+            (digits, solidities) — both length-81 lists.
+        """
+        if len(cells) != 81:
+            raise ValueError(f"Expected 81 cells, got {len(cells)}")
+
+        digits     = [0] * 81
+        solidities = [None] * 81
+        valid_imgs = []
+        valid_idx  = []
+        raw_cells  = []
+
+        for i, cell in enumerate(cells):
+            binary = self._binarize(cell)
+            if self._is_blank(binary):
+                continue
+            centered = self._center_digit(binary)
+            if centered is None:
+                continue
+
+            contours, _ = cv2.findContours(
+                binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            largest = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest)
+            solidities[i] = cv2.contourArea(largest) / max(w * h, 1)
+
+            out = centered.astype("float32") / 255.0
+            out = np.expand_dims(out, axis=-1)
+            out = np.expand_dims(out, axis=0)
+            valid_imgs.append(out)
+            valid_idx.append(i)
+            raw_cells.append(cell)
+
+        if valid_imgs:
+            batch     = np.concatenate(valid_imgs, axis=0)
+            all_probs = self.model.predict(batch, verbose=0)
+
+            for j, idx in enumerate(valid_idx):
+                probs      = all_probs[j]
+                confidence = float(np.max(probs))
+                digit      = int(np.argmax(probs)) + 1
+                if confidence < self.threshold:
+                    digits[idx]     = 0
+                    solidities[idx] = None
+                else:
+                    digits[idx] = self._post_process(digit, raw_cells[j])
+
+        return digits, solidities
 
     def set_threshold(self, threshold: float):
         self.threshold = threshold

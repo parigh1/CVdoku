@@ -32,13 +32,22 @@ class SudokuSolver:
 
         return False
 
-    def solve_with_recovery(self, grid: list) -> tuple:
+    def solve_with_recovery(self, grid: list, solidities: list = None) -> tuple:
         """
-        Try to solve the board. If it has conflicts, attempt automatic
-        correction by trying common CNN misread swaps:
-            1 ↔ 7  (most common — thin digit confusion)
-            5 ↔ 6  (second most common — rounded digit confusion)
-            8 ↔ 9  (occasional — similar shape)
+        Try to solve the board. If it has conflicts (or is simply
+        unsolvable as given), attempt automatic correction in two stages:
+
+        Stage 1 — swap recovery: tries common CNN misread swaps
+        (1↔7, 5↔6, 8↔9, ...). This targets DIGIT CONFUSION — the model
+        read the right cell, wrong digit.
+
+        Stage 2 — blank-removal recovery (only if `solidities` is given):
+        tries blanking out the filled cell(s) with the lowest solidity
+        score. This targets a DIFFERENT failure mode — a phantom digit
+        in a cell that should be blank (e.g. screen glare/scan-line noise
+        narrowly clearing the blank-detection gate). There's no "correct"
+        digit to swap a phantom to, so swap recovery can never fix this;
+        it has to be removed instead. See classifier.predict_with_solidity().
 
         Returns:
             (solved_grid, True)  if solution found
@@ -73,7 +82,62 @@ class SudokuSolver:
                             print(f"[Solver] Recovered by swapping {a1}↔{b1} and {a2}↔{b2}")
                             return attempt, True
 
+        # Stage 2 — blank-removal recovery for phantom digits
+        if solidities is not None:
+            attempt = self._try_blank_removal(grid, solidities)
+            if attempt is not None:
+                return attempt, True
+
         return None, False
+
+    def _try_blank_removal(self, grid: list, solidities: list,
+                            max_candidates: int = 6) -> list:
+        """
+        Try blanking out the filled cells with the LOWEST solidity scores
+        first (most likely to be a phantom misread of a blank, least
+        likely to be a genuine digit) — single cells first, then pairs
+        among the most suspicious candidates. Returns a solved grid if
+        any removal makes the board solvable, else None.
+        """
+        candidates = sorted(
+            (
+                (solidities[r * 9 + c], r, c)
+                for r in range(9) for c in range(9)
+                if grid[r][c] != 0 and solidities[r * 9 + c] is not None
+            ),
+            key=lambda t: t[0]
+        )[:max_candidates]
+
+        if not candidates:
+            return None
+
+        # Single-cell removal
+        for _, r, c in candidates:
+            new_grid = copy.deepcopy(grid)
+            new_grid[r][c] = 0
+            if self.count_givens(new_grid) < 17:
+                continue
+            if self.is_valid_board(new_grid):
+                attempt = copy.deepcopy(new_grid)
+                if self.solve(attempt):
+                    print(f"[Solver] Recovered by blanking suspected phantom digit at row {r+1}, col {c+1}")
+                    return attempt
+
+        # Two-cell removal among the most suspicious candidates
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                new_grid = copy.deepcopy(grid)
+                new_grid[candidates[i][1]][candidates[i][2]] = 0
+                new_grid[candidates[j][1]][candidates[j][2]] = 0
+                if self.count_givens(new_grid) < 17:
+                    continue
+                if self.is_valid_board(new_grid):
+                    attempt = copy.deepcopy(new_grid)
+                    if self.solve(attempt):
+                        print("[Solver] Recovered by blanking 2 suspected phantom digits")
+                        return attempt
+
+        return None
 
     def _try_swap(self, grid: list, a: int, b: int) -> list:
         """

@@ -1,14 +1,19 @@
 """
 CVdoku — Digit Classifier Training Script
 ==========================================
-Trains a CNN on MNIST digits with augmentation to handle
-both handwritten and printed digits (as found in Sudoku puzzles).
+Trains a CNN on synthetic printed-font digits (the actual domain this app
+needs — see synth_fonts.py) with a small slice of MNIST mixed in for
+robustness if a handwritten board is ever scanned.
 
-v2 improvements:
-- Erosion augmentation to simulate thin printed digits (fixes 1 vs 7 confusion)
-- Elastic distortion to handle various font styles
-- Class weights to handle MNIST imbalance
-- Saves in both .h5 and .keras formats
+v3 — printed-font-first retrain (fixes the 1 vs 7 domain gap at the source):
+- Primary signal: synth_fonts.py — digits rendered in real sans-serif fonts,
+  passed through the SAME preprocessing pipeline classifier.py uses at
+  inference, closing both the font-shape gap AND the preprocessing-mismatch
+  gap that a downloaded dataset (MNIST, Chars74K) can't close on its own.
+- MNIST kept at a small weight (~15% of the dataset) purely for robustness
+  to handwritten puzzles — not the primary training signal anymore.
+- Same CNN architecture, callbacks, and class weighting as v2 — the
+  architecture was never the problem, the data was.
 
 Run once before using main.py:
     python train.py
@@ -25,37 +30,39 @@ from tensorflow.keras import layers
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from sklearn.model_selection import train_test_split
 
+from synth_fonts import generate_dataset as generate_synthetic_fonts
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "digit_model.h5")
 PLOT_PATH  = os.path.join(BASE_DIR, "resources", "training_history.png")
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
-IMG_SIZE   = 28
-NUM_EPOCHS = 20
-BATCH_SIZE = 128
-LEARN_RATE = 1e-3
+IMG_SIZE             = 28
+NUM_EPOCHS           = 20
+BATCH_SIZE           = 128
+LEARN_RATE           = 1e-3
+SYNTH_SAMPLES_PER_DIGIT = 3000   # ~27k synthetic printed-font samples total
+MNIST_FRACTION       = 0.15      # MNIST kept only as a small robustness slice
 
 
 def load_and_prepare_data():
-    """Load MNIST, keep only digits 1-9, apply printed-digit augmentation."""
-    print("[1/5] Loading MNIST dataset...")
-    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+    """
+    Build the training set from synthetic printed-font renders (primary
+    signal) plus a small slice of MNIST (robustness to handwritten boards).
+    """
+    print("[1/5] Generating synthetic printed-font dataset...")
+    x_synth, y_synth = generate_synthetic_fonts(samples_per_digit=SYNTH_SAMPLES_PER_DIGIT)
+    print(f"    Synthetic samples: {x_synth.shape[0]}")
 
-    x_all = np.concatenate([x_train, x_test], axis=0)
-    y_all = np.concatenate([y_train, y_test], axis=0)
+    print("[2/5] Loading a small MNIST slice for handwriting robustness...")
+    x_mnist, y_mnist = _load_mnist_slice(target_count=int(
+        x_synth.shape[0] * MNIST_FRACTION / (1 - MNIST_FRACTION)
+    ))
+    print(f"    MNIST samples (handwriting robustness only): {x_mnist.shape[0]}")
 
-    # Keep only 1-9
-    mask  = y_all > 0
-    x_all = x_all[mask]
-    y_all = y_all[mask]
-
-    print(f"[2/5] Generating printed-digit augmentation...")
-    x_printed, y_printed = generate_printed_variants(x_all, y_all)
-
-    # Combine original + printed variants
-    x_combined = np.concatenate([x_all, x_printed], axis=0)
-    y_combined  = np.concatenate([y_all, y_printed], axis=0)
+    x_combined = np.concatenate([x_synth, x_mnist], axis=0)
+    y_combined = np.concatenate([y_synth, y_mnist], axis=0)
 
     # Normalise and add channel dim
     x_combined = x_combined.astype("float32") / 255.0
@@ -74,41 +81,20 @@ def load_and_prepare_data():
     return x_train, x_val, y_train, y_val
 
 
-def generate_printed_variants(x_all, y_all):
-    """
-    Generate synthetic printed-digit variants from MNIST samples.
-    Targets the most common misclassifications:
-    - Thin/eroded digits (simulates slim app fonts — fixes 1 vs 7)
-    - High contrast / clean binary (simulates printed puzzle digits)
-    - Slightly thickened digits (simulates bold fonts)
-    """
-    printed_imgs   = []
-    printed_labels = []
+def _load_mnist_slice(target_count: int):
+    """Load MNIST digits 1-9, downsampled to target_count, resized to match
+    the synthetic samples (28x28, same binarized-and-centered convention)."""
+    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+    x_all = np.concatenate([x_train, x_test], axis=0)
+    y_all = np.concatenate([y_train, y_test], axis=0)
 
-    # Only augment a subset to keep training time reasonable
-    indices = np.random.choice(len(x_all), size=min(20000, len(x_all)), replace=False)
+    mask  = y_all > 0
+    x_all = x_all[mask]
+    y_all = y_all[mask]
 
-    for idx in indices:
-        img   = x_all[idx].copy()
-        label = y_all[idx]
-
-        # Variant 1: eroded (thin) — simulates slim app fonts
-        kernel  = np.ones((2, 2), np.uint8)
-        eroded  = cv2.erode(img, kernel, iterations=1)
-        printed_imgs.append(eroded)
-        printed_labels.append(label)
-
-        # Variant 2: dilated (thick) — simulates bold fonts
-        dilated = cv2.dilate(img, kernel, iterations=1)
-        printed_imgs.append(dilated)
-        printed_labels.append(label)
-
-        # Variant 3: high contrast binary — simulates clean printed grids
-        _, binary = cv2.threshold(img, 80, 255, cv2.THRESH_BINARY)
-        printed_imgs.append(binary)
-        printed_labels.append(label)
-
-    return np.array(printed_imgs), np.array(printed_labels)
+    target_count = min(target_count, len(x_all))
+    idx = np.random.RandomState(42).choice(len(x_all), size=target_count, replace=False)
+    return x_all[idx], y_all[idx]
 
 
 def build_augmenter():

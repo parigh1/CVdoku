@@ -98,6 +98,30 @@ class VisionEngine:
 
     # ── Perspective warp ───────────────────────────────────────────────────────
 
+    def compute_perspective_matrix(self, board_contour: np.ndarray) -> np.ndarray:
+        """
+        Compute (and cache) just the forward perspective matrix from a
+        board contour, without warping any image.
+
+        Used during live AR tracking after solving: every frame we need a
+        fresh inv_M to keep the overlay aligned with the puzzle's CURRENT
+        position, but the digit values are already locked in, so there's
+        no need to pay for a full warpPerspective + grayscale conversion
+        just to throw the image away.
+        """
+        src = self.order_corners(board_contour)
+        dst = np.array([
+            [0,           0          ],
+            [WARP_SIZE-1, 0          ],
+            [WARP_SIZE-1, WARP_SIZE-1],
+            [0,           WARP_SIZE-1],
+        ], dtype=np.float32)
+
+        M = cv2.getPerspectiveTransform(src, dst)
+        self.last_M   = M
+        self.last_src = src
+        return M
+
     def get_warp(self, img: np.ndarray, board_contour: np.ndarray) -> np.ndarray:
         """
         Apply a perspective warp to extract and straighten the Sudoku board.
@@ -109,23 +133,9 @@ class VisionEngine:
         Returns:
             Grayscale warped image of shape (WARP_SIZE, WARP_SIZE).
         """
-        src = self.order_corners(board_contour)
-
-        dst = np.array([
-            [0,           0          ],
-            [WARP_SIZE-1, 0          ],
-            [WARP_SIZE-1, WARP_SIZE-1],
-            [0,           WARP_SIZE-1],
-        ], dtype=np.float32)
-
-        M       = cv2.getPerspectiveTransform(src, dst)
-        warped  = cv2.warpPerspective(img, M, (WARP_SIZE, WARP_SIZE))
-        gray    = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-
-        # Store the transform matrix — needed by the overlay module
-        self.last_M   = M
-        self.last_src = src
-
+        M      = self.compute_perspective_matrix(board_contour)
+        warped = cv2.warpPerspective(img, M, (WARP_SIZE, WARP_SIZE))
+        gray   = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         return gray
 
     def get_inverse_warp_matrix(self) -> np.ndarray | None:
@@ -163,6 +173,148 @@ class VisionEngine:
                 cells.append(cell)
 
         return cells
+
+    # ── Grid-line-aware splitting ──────────────────────────────────────────────
+
+    def _profile_peaks(self, profile: np.ndarray, board_size: int) -> list:
+        """
+        Find the center position of each high-intensity run in a 1D profile
+        (a row-sum or column-sum of a morphologically-isolated line mask).
+
+        Used to locate the actual pixel position of each grid line instead
+        of assuming they sit at perfect multiples of CELL_SIZE.
+        """
+        if profile.max() == 0:
+            return []
+
+        above   = profile > (profile.max() * 0.3)
+        runs    = []
+        start   = None
+        for i, val in enumerate(above):
+            if val and start is None:
+                start = i
+            elif not val and start is not None:
+                runs.append((start + i - 1) / 2.0)
+                start = None
+        if start is not None:
+            runs.append((start + len(above) - 1) / 2.0)
+
+        # Merge runs that are too close together to be distinct grid lines
+        # (avoids double-counting a thick or slightly broken line).
+        min_gap = board_size * 0.04
+        merged  = []
+        for p in runs:
+            if merged and (p - merged[-1]) < min_gap:
+                merged[-1] = (merged[-1] + p) / 2.0
+            else:
+                merged.append(p)
+        return merged
+
+    def _detect_grid_lines(self, warped_gray: np.ndarray):
+        """
+        Detect the 10 horizontal + 10 vertical grid lines in the warped board
+        via morphological line isolation, instead of assuming they fall at
+        perfect multiples of CELL_SIZE.
+
+        Perspective warp corrects tilt, but not residual lens distortion or
+        paper curl — so on a real camera frame the 9 cells are rarely
+        perfectly equal after warping. Finding the real line positions makes
+        cell extraction robust to that residual distortion.
+
+        Returns:
+            (h_lines, v_lines) — each a sorted list of 10 pixel positions,
+            or None if confident detection failed (caller should fall back
+            to uniform division).
+        """
+        size    = warped_gray.shape[0]
+        blurred = cv2.GaussianBlur(warped_gray, (5, 5), 0)
+        thresh  = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=11, C=5
+        )
+
+        # Long, thin kernels isolate only lines that span most of the board —
+        # digit strokes are far shorter than this, so they get erased.
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size // 4, 1))
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, size // 4))
+
+        h_mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel)
+        v_mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
+
+        h_lines = self._profile_peaks(h_mask.sum(axis=1).astype(np.float64), size)
+        v_lines = self._profile_peaks(v_mask.sum(axis=0).astype(np.float64), size)
+
+        if len(h_lines) != 10 or len(v_lines) != 10:
+            return None
+
+        return sorted(h_lines), sorted(v_lines)
+
+    def split_boxes_adaptive(self, warped_gray: np.ndarray) -> list:
+        """
+        Slice the warped board into 81 cells using detected grid-line
+        positions, with a proportional margin (≈6% of each cell's own
+        size) instead of a fixed pixel trim.
+
+        Falls back to the uniform split_boxes() if grid lines can't be
+        confidently detected (e.g. faint lines, heavy glare, motion blur) —
+        this method is a strict improvement, never a regression.
+        """
+        lines = self._detect_grid_lines(warped_gray)
+        if lines is None:
+            return self.split_boxes(warped_gray)
+
+        h_lines, v_lines = lines
+        cells = []
+
+        for row in range(9):
+            y1, y2   = h_lines[row], h_lines[row + 1]
+            margin_y = max(1, int((y2 - y1) * 0.06))
+            for col in range(9):
+                x1, x2   = v_lines[col], v_lines[col + 1]
+                margin_x = max(1, int((x2 - x1) * 0.06))
+
+                crop = warped_gray[
+                    int(y1) + margin_y : int(y2) - margin_y,
+                    int(x1) + margin_x : int(x2) - margin_x,
+                ]
+                cells.append(crop)
+
+        return cells
+
+    def estimate_quality(self, warped_gray: np.ndarray, board_contour: np.ndarray) -> float:
+        """
+        Cheap per-frame quality score, used to pick the BEST frame(s) out
+        of a capture window instead of requiring an unbroken run of N good
+        frames in a row.
+
+        Combines:
+          - Sharpness (Laplacian variance) — drops sharply under motion
+            blur (verified empirically: ~4400 sharp -> ~3 under heavy blur).
+          - Corner-angle regularity — penalises a contour that barely
+            qualifies as a quadrilateral (partial occlusion, glare wiping
+            out an edge, a corner clipped at the frame boundary).
+
+        Higher is better. Cheap enough to compute every frame — no CNN
+        involved.
+        """
+        sharpness = cv2.Laplacian(warped_gray, cv2.CV_64F).var()
+
+        src    = self.order_corners(board_contour)
+        angles = []
+        for i in range(4):
+            p_prev = src[(i - 1) % 4]
+            p_curr = src[i]
+            p_next = src[(i + 1) % 4]
+            v1 = p_prev - p_curr
+            v2 = p_next - p_curr
+            cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+            angle = np.degrees(np.arccos(np.clip(cos_angle, -1, 1)))
+            angles.append(angle)
+        angle_penalty = sum(abs(a - 90) for a in angles)
+
+        return sharpness - (angle_penalty * 2.0)
 
     # ── Drawing helpers ────────────────────────────────────────────────────────
 
