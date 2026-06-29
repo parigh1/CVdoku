@@ -6,9 +6,10 @@
 
 ## Demo
 
-![Demo coming soon](resources/demo.gif)
+![Demo coming soon](resources/demo.gif)<img width="550" height="552" alt="Screenshot 2026-06-27 233325" src="https://github.com/user-attachments/assets/6e93bc09-24a9-4021-8e5b-9335926456e3" />
 
-*Solved digits appear projected onto the physical puzzle in the live camera feed.*
+
+*Debugged sudoku grid, still in development phase...*
 
 ---
 
